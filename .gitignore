@@ -1,11 +1,11 @@
 *.code-workspace
-multidatabackend*json
+# multidatabackend*json
 # Python and virtual environment files
 output/
 temp/
 env.sh
 *.pem
-*/config/config.json
+# */config/config.json
 user_prompt_library.json
 __pycache__/
 .venv/
@@ -48,10 +48,10 @@ Thumbs.db
 files.tbz
 */config/auth.json
 work
-multidatabackend.json
+# multidatabackend.json
 multidatabackend_sd2x.json
 
-config/*.json
+# config/*.json
 config/*.env
 wandb/
 cache/

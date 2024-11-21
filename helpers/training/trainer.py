@@ -1,62 +1,63 @@
-import huggingface_hub
-from helpers.training.default_settings.safety_check import safety_check
-from helpers.publishing.huggingface import HubManager
-from configure import model_labels
-import shutil
+import copy
 import hashlib
 import json
-import copy
-import random
 import logging
 import math
 import os
+import random
+import shutil
 import sys
-import glob
+
+import huggingface_hub
 import wandb
+from configure import model_labels
+from helpers.publishing.huggingface import HubManager
+from helpers.training.default_settings.safety_check import safety_check
 
 # Quiet down, you.
 os.environ["ACCELERATE_LOG_LEVEL"] = "WARNING"
+from accelerate.logging import get_logger
+from diffusers.models.embeddings import get_2d_rotary_pos_embed
 from helpers import log_format  # noqa
-from helpers.configuration.loader import load_config
 from helpers.caching.memory import reclaim_memory
-from helpers.training.multi_process import _get_rank as get_rank
-from helpers.training.validation import Validation, prepare_validation_prompt_list
-from helpers.training.evaluation import ModelEvaluator
-from helpers.training.state_tracker import StateTracker
-from helpers.training.schedulers import load_scheduler_from_args
-from helpers.training.custom_schedule import get_lr_scheduler
+from helpers.configuration.loader import load_config
+from helpers.data_backend.factory import (
+    BatchFetcher,
+    configure_multi_databackend,
+    random_dataloader_iterator,
+)
+from helpers.models.smoldit import get_resize_crop_region_for_grid
 from helpers.training.adapter import determine_adapter_target_modules, load_lora_weights
-from helpers.training.diffusion_model import load_diffusion_model
-from helpers.training.text_encoding import (
-    load_tes,
-    determine_te_path_subfolder,
-    import_model_class_from_model_name_or_path,
-    get_tokenizers,
+from helpers.training.custom_schedule import (
+    generate_timestep_weights,
+    get_lr_scheduler,
+    segmented_timestep_selection,
 )
-from helpers.training.optimizer_param import (
-    determine_optimizer_class_with_config,
-    determine_params_to_optimize,
-    is_lr_scheduler_disabled,
-    cpu_offload_optimizer,
-)
-from helpers.data_backend.factory import BatchFetcher
 from helpers.training.deepspeed import (
     deepspeed_zero_init_disabled_context_manager,
     prepare_model_for_deepspeed,
 )
-from helpers.training.wrappers import unwrap_model
-from helpers.data_backend.factory import configure_multi_databackend
-from helpers.data_backend.factory import random_dataloader_iterator
-from helpers.training import steps_remaining_in_epoch
-from helpers.training.custom_schedule import (
-    generate_timestep_weights,
-    segmented_timestep_selection,
-)
+from helpers.training.diffusion_model import load_diffusion_model
+from helpers.training.evaluation import ModelEvaluator
 from helpers.training.min_snr_gamma import compute_snr
+from helpers.training.multi_process import _get_rank as get_rank
+from helpers.training.optimizer_param import (
+    cpu_offload_optimizer,
+    determine_optimizer_class_with_config,
+    determine_params_to_optimize,
+    is_lr_scheduler_disabled,
+)
 from helpers.training.peft_init import init_lokr_network_with_perturbed_normal
-from accelerate.logging import get_logger
-from diffusers.models.embeddings import get_2d_rotary_pos_embed
-from helpers.models.smoldit import get_resize_crop_region_for_grid
+from helpers.training.schedulers import load_scheduler_from_args
+from helpers.training.state_tracker import StateTracker
+from helpers.training.text_encoding import (
+    determine_te_path_subfolder,
+    get_tokenizers,
+    import_model_class_from_model_name_or_path,
+    load_tes,
+)
+from helpers.training.validation import Validation, prepare_validation_prompt_list
+from helpers.training.wrappers import unwrap_model
 
 logger = get_logger(
     "SimpleTuner", log_level=os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO")
@@ -75,12 +76,12 @@ training_logger.setLevel(training_logger_level)
 # Less important logs.
 filelock_logger.setLevel("WARNING")
 connection_logger.setLevel("WARNING")
-import torch
-import diffusers
 import accelerate
-import transformers
+import diffusers
+import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
+import transformers
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from configure import model_classes
@@ -90,42 +91,31 @@ try:
     from lycoris import LycorisNetwork
 except:
     print("[ERROR] Lycoris not available. Please install ")
-from tqdm.auto import tqdm
-from transformers import PretrainedConfig, CLIPTokenizer
-from helpers.models.sdxl.pipeline import StableDiffusionXLPipeline
-from diffusers import StableDiffusion3Pipeline
-
 from diffusers import (
     AutoencoderKL,
     ControlNetModel,
     DDIMScheduler,
     DDPMScheduler,
-    UNet2DConditionModel,
-    FluxTransformer2DModel,
-    PixArtTransformer2DModel,
-    EulerDiscreteScheduler,
     EulerAncestralDiscreteScheduler,
+    EulerDiscreteScheduler,
+    StableDiffusion3Pipeline,
     UniPCMultistepScheduler,
 )
-
+from diffusers.utils import check_min_version, convert_state_dict_to_diffusers
+from diffusers.utils.import_utils import is_xformers_available
+from helpers.models.flux import (
+    apply_flux_schedule_shift,
+    get_mobius_guidance,
+    pack_latents,
+    prepare_latent_image_ids,
+    unpack_latents,
+)
+from helpers.models.sdxl.pipeline import StableDiffusionXLPipeline
+from helpers.training.ema import EMAModel
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
-from helpers.training.ema import EMAModel
-from diffusers.utils import (
-    check_min_version,
-    convert_state_dict_to_diffusers,
-    is_wandb_available,
-)
-from diffusers.utils.import_utils import is_xformers_available
+from tqdm.auto import tqdm
 from transformers.utils import ContextManagers
-
-from helpers.models.flux import (
-    prepare_latent_image_ids,
-    pack_latents,
-    unpack_latents,
-    get_mobius_guidance,
-    apply_flux_schedule_shift,
-)
 
 is_optimi_available = False
 try:
@@ -253,7 +243,7 @@ class Trainer:
             self._exit_on_signal()
             self.resume_and_prepare()
             self._exit_on_signal()
-            self.init_trackers()
+            # self.init_trackers()
 
             # Start the training process
             self.train()
@@ -1165,7 +1155,9 @@ class Trainer:
                 (
                     self.controlnet
                     if self.config.controlnet
-                    else self.transformer if self.transformer is not None else self.unet
+                    else self.transformer
+                    if self.transformer is not None
+                    else self.unet
                 ),
                 self.optimizer,
             )
@@ -1190,7 +1182,7 @@ class Trainer:
                 use_deepspeed_scheduler=False,
             )
         else:
-            logger.info(f"Using dummy learning rate scheduler")
+            logger.info("Using dummy learning rate scheduler")
             if torch.backends.mps.is_available():
                 lr_scheduler = None
             else:
@@ -1510,7 +1502,7 @@ class Trainer:
             structured_data={"message": f"Resuming model: {path}"},
             message_type="init_resume_checkpoint",
         )
-        training_state_filename = f"training_state.json"
+        training_state_filename = "training_state.json"
         if get_rank() > 0:
             training_state_filename = f"training_state-{get_rank()}.json"
         for _, backend in StateTracker.get_data_backends().items():
@@ -1816,16 +1808,16 @@ class Trainer:
         # we should set should_abort = True on each data backend's vae cache, metadata, and text backend
         for _, backend in StateTracker.get_data_backends().items():
             if "vaecache" in backend:
-                logger.debug(f"Aborting VAE cache")
+                logger.debug("Aborting VAE cache")
                 backend["vaecache"].should_abort = True
             if "metadata_backend" in backend:
-                logger.debug(f"Aborting metadata backend")
+                logger.debug("Aborting metadata backend")
                 backend["metadata_backend"].should_abort = True
             if "text_backend" in backend:
-                logger.debug(f"Aborting text backend")
+                logger.debug("Aborting text backend")
                 backend["text_backend"].should_abort = True
             if "sampler" in backend:
-                logger.debug(f"Aborting sampler")
+                logger.debug("Aborting sampler")
                 backend["sampler"].should_abort = True
         self.should_abort = True
 
@@ -2075,7 +2067,7 @@ class Trainer:
         return model_pred
 
     def train(self):
-        self.init_trackers()
+        # self.init_trackers()
         self._train_initial_msg()
 
         if self.config.validation_on_startup and self.state["global_step"] <= 1:
@@ -2604,7 +2596,7 @@ class Trainer:
                         )
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
-                wandb_logs = {}
+                # wandb_logs = {}
                 if self.accelerator.sync_gradients:
                     try:
                         if self.config.is_schedulefree:
@@ -2617,21 +2609,21 @@ class Trainer:
                         logger.error(
                             f"Failed to get the last learning rate from the scheduler. Error: {e}"
                         )
-                    wandb_logs = {
-                        "train_loss": self.train_loss,
-                        "optimization_loss": loss,
-                        "learning_rate": self.lr,
-                        "epoch": epoch,
-                    }
-                    if parent_loss is not None:
-                        wandb_logs["regularisation_loss"] = parent_loss
+                    # wandb_logs = {
+                    #     "train_loss": self.train_loss,
+                    #     "optimization_loss": loss,
+                    #     "learning_rate": self.lr,
+                    #     "epoch": epoch,
+                    # }
+                    # if parent_loss is not None:
+                    #     wandb_logs["regularisation_loss"] = parent_loss
                     if self.config.model_family == "flux" and self.guidance_values_list:
                         # avg the values
                         guidance_values = torch.tensor(self.guidance_values_list).mean()
-                        wandb_logs["mean_cfg"] = guidance_values.item()
+                        # wandb_logs["mean_cfg"] = guidance_values.item()
                         self.guidance_values_list = []
-                    if grad_norm is not None:
-                        wandb_logs["grad_norm"] = grad_norm
+                    # if grad_norm is not None:
+                    #     wandb_logs["grad_norm"] = grad_norm
                     if self.validation is not None and hasattr(
                         self.validation, "evaluation_result"
                     ):
@@ -2639,7 +2631,7 @@ class Trainer:
                         if eval_result is not None and type(eval_result) == dict:
                             # add the dict to wandb_logs
                             self.validation.clear_eval_result()
-                            wandb_logs.update(eval_result)
+                            # wandb_logs.update(eval_result)
 
                     progress_bar.update(1)
                     self.state["global_step"] += 1
@@ -2653,8 +2645,8 @@ class Trainer:
                                 parameters=self._get_trainable_parameters(),
                                 global_step=self.state["global_step"],
                             )
-                            wandb_logs["ema_decay_value"] = self.ema_model.get_decay()
-                            ema_decay_value = wandb_logs["ema_decay_value"]
+                            # wandb_logs["ema_decay_value"] = self.ema_model.get_decay()
+                            # ema_decay_value = wandb_logs["ema_decay_value"]
                         self.accelerator.wait_for_everyone()
 
                     # Log scatter plot to wandb
@@ -2670,12 +2662,12 @@ class Trainer:
                         table = wandb.Table(
                             data=data, columns=["global_step", "timestep"]
                         )
-                        wandb_logs["timesteps_scatter"] = wandb.plot.scatter(
-                            table,
-                            "global_step",
-                            "timestep",
-                            title="Timestep distribution by step",
-                        )
+                        # wandb_logs["timesteps_scatter"] = wandb.plot.scatter(
+                        #     table,
+                        #     "global_step",
+                        #     "timestep",
+                        #     title="Timestep distribution by step",
+                        # )
 
                     # Clear buffers
                     self.timesteps_buffer = []
@@ -2684,15 +2676,15 @@ class Trainer:
                     avg_training_data_luminance = sum(training_luminance_values) / len(
                         training_luminance_values
                     )
-                    wandb_logs["train_luminance"] = avg_training_data_luminance
+                    # wandb_logs["train_luminance"] = avg_training_data_luminance
 
-                    logger.debug(
+                    logger.info(
                         f"Step {self.state['global_step']} of {self.config.max_train_steps}: loss {loss.item()}, lr {self.lr}, epoch {epoch}/{self.config.num_train_epochs}, ema_decay_value {ema_decay_value}, train_loss {self.train_loss}"
                     )
-                    self.accelerator.log(
-                        wandb_logs,
-                        step=self.state["global_step"],
-                    )
+                    # self.accelerator.log(
+                    #     wandb_logs,
+                    #     step=self.state["global_step"],
+                    # )
                     webhook_pending_msg = f"Step {self.state['global_step']} of {self.config.max_train_steps}: loss {round(loss.item(), 4)}, lr {self.lr}, epoch {epoch}/{self.config.num_train_epochs}, ema_decay_value {ema_decay_value}, train_loss {round(self.train_loss, 4)}"
 
                     # Reset some values for the next go.
@@ -2799,8 +2791,8 @@ class Trainer:
                     "step_loss": loss.detach().item(),
                     "lr": float(self.lr),
                 }
-                if "mean_cfg" in wandb_logs:
-                    logs["mean_cfg"] = wandb_logs["mean_cfg"]
+                # if "mean_cfg" in wandb_logs:
+                #     logs["mean_cfg"] = wandb_logs["mean_cfg"]
 
                 progress_bar.set_postfix(**logs)
                 self.mark_optimizer_eval()

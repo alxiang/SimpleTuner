@@ -1,8 +1,8 @@
-from helpers.training.trainer import Trainer
-from helpers.training.state_tracker import StateTracker
-from helpers import log_format
 import logging
 from os import environ
+
+from helpers.training.state_tracker import StateTracker
+from helpers.training.trainer import Trainer
 
 logger = logging.getLogger("SimpleTuner")
 logger.setLevel(environ.get("SIMPLETUNER_LOG_LEVEL", "INFO"))
@@ -48,7 +48,7 @@ if __name__ == "__main__":
 
         trainer.resume_and_prepare()
 
-        trainer.init_trackers()
+        # trainer.init_trackers()
         trainer.train()
     except KeyboardInterrupt:
         if StateTracker.get_webhook_handler() is not None:
